@@ -1,9 +1,11 @@
 #include "vm.h"
+#include "parser.h"
 
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <linux/kvm.h>
+
 
 int main(int argc, char *argv[])
 {
@@ -14,12 +16,18 @@ int main(int argc, char *argv[])
 	int ret = 0;
 	int irq_pending = IRQ_COUNT;
 
-	if (argc != 2) {
+	if (argc < 2) {
 		printf("The program requests an image to run: %s <guest-image>\n", argv[0]);
 		return 1;
 	}
 
-	if (vm_init(&v, MEM_SIZE)) {
+	struct hv_args args;
+
+	if (parse_args(argc, argv, &args) < 0) {
+		return 1;
+	}
+
+	if (vm_init(&v, args.memory_size)) {
 		printf("Failed to init the VM\n");
 		return 1;
 	}
@@ -38,7 +46,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (load_guest_image(&v, argv[1], GUEST_START_ADDR) < 0) {
+	if (load_guest_image(&v, args.guest_paths[0], GUEST_START_ADDR) < 0) {
 		printf("Failed to load guest image\n");
 		vm_destroy(&v);
 		return 1;
