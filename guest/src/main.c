@@ -54,6 +54,10 @@ _start(void)
 	for (s = "Hello, world!\n"; *s; ++s)
 		outb(0xE9, *s);
 
+	uint8_t c = inb(0xE9);
+	outb(0xE9, c);
+	outb(0xE9, '\n');
+
 	for (;;)
 		asm volatile("hlt");
 }

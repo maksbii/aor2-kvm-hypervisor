@@ -1,4 +1,8 @@
 #include "vm.h"
+#include "parser.h"
+
+#define PD_ENTRIES_MAX 4
+#define _2MB 0x200000ull
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +129,7 @@ static void setup_segments_64(struct kvm_sregs *sregs)
 	sregs->ds = sregs->es = sregs->fs = sregs->gs = sregs->ss = data;
 }
 
-void setup_long_mode(struct vm *v, struct kvm_sregs *sregs)
+void setup_long_mode(struct vm *v, struct kvm_sregs *sregs, enum page_size pageSize)
 {
 	uint64_t pml4_addr = 0x1000;
 	uint64_t *pml4 = (void *)(v->mem + pml4_addr);
@@ -136,17 +140,30 @@ void setup_long_mode(struct vm *v, struct kvm_sregs *sregs)
 	uint64_t pd_addr = 0x3000;
 	uint64_t *pd = (void *)(v->mem + pd_addr);
 
-	uint64_t pt_addr = 0x4000;
-	uint64_t *pt = (void *)(v->mem + pt_addr);
-
 	pml4[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pdpt_addr;
 	pdpt[0] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pd_addr;
-	pd[0]   = PDE64_PRESENT | PDE64_RW | PDE64_USER | pt_addr;
 
-	for (int i = 0; i < GUEST_CODE_PAGES; i++)
-		pt[i] = (GUEST_START_ADDR + i * 0x1000) | PDE64_PRESENT | PDE64_RW | PDE64_USER;
+	int num_pd_entries = (v->mem_size / _2MB);	
+	if (num_pd_entries > PD_ENTRIES_MAX)
+		num_pd_entries = PD_ENTRIES_MAX;
+	
+	if (pageSize == PAGE_SIZE_4KB) {
 
-	pt[511] = 0x6000 | PDE64_PRESENT | PDE64_RW | PDE64_USER;
+		for (int pd_entry = 0; pd_entry < num_pd_entries; pd_entry++) {
+			uint64_t pt_addr = 0x4000 + pd_entry * 0x1000;
+			uint64_t *pt = (void *)(v->mem + pt_addr);
+
+			pd[pd_entry] = PDE64_PRESENT | PDE64_RW | PDE64_USER | pt_addr;
+
+			for (int i = 0; i < 512; i++) {
+				pt[i] = (pd_entry * _2MB + i * 0x1000) | PDE64_PRESENT | PDE64_RW | PDE64_USER;
+			}
+		}
+	} else if (pageSize == PAGE_SIZE_2MB) {
+		for (int pd_entry = 0; pd_entry < num_pd_entries; pd_entry++) {
+			pd[pd_entry] = (pd_entry * _2MB) | PDE64_PRESENT | PDE64_RW | PDE64_USER | PDE64_PS;
+		}
+	}
 
 	sregs->cr3  = pml4_addr;
 	sregs->cr4  = CR4_PAE;

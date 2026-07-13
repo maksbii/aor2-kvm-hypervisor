@@ -2,20 +2,167 @@
 #include "parser.h"
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+#include <stdlib.h>
 
+struct vm_thread_arg {
+	const char *guest_path;
+	uint64_t memory_size;
+	enum page_size page_size;
+	int id;
+};
 
-int main(int argc, char *argv[])
+static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void vm_log(int id, int *line_start, const char *fmt, ...)
 {
+	va_list ap;
+	char buf[256];
+	size_t len;
+
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	pthread_mutex_lock(&stdout_lock);
+	if (*line_start)
+		printf("[VM %d] ", id);
+	fputs(buf, stdout);
+	fflush(stdout);
+	pthread_mutex_unlock(&stdout_lock);
+
+	len = strlen(buf);
+	*line_start = (len > 0 && buf[len - 1] == '\n');
+}
+
+static void *vm_thread_main(void *arg) {
+	struct vm_thread_arg *ta = arg;
+
 	struct vm v;
 	struct kvm_sregs sregs;
 	struct kvm_regs regs;
 	int stop = 0;
 	int ret = 0;
 	int irq_pending = IRQ_COUNT;
+	char linebuf[256];
+	size_t linelen = 0;
+	int line_start = 1;
 
+	if (vm_init(&v, ta->memory_size)) {
+		vm_log(ta->id, &line_start, "Failed to init\n");
+		return NULL;
+	}
+
+	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
+		perror("KVM_GET_SREGS");
+		vm_destroy(&v);
+		return NULL;
+	}
+
+	setup_long_mode(&v, &sregs, ta->page_size);
+
+	if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
+		perror("KVM_SET_SREGS");
+		vm_destroy(&v);
+		return NULL;
+	}
+
+	if (load_guest_image(&v, ta->guest_path, GUEST_START_ADDR) < 0) {
+		vm_log(ta->id, &line_start, "Failed to load guest image\n");
+		vm_destroy(&v);
+		return NULL;
+	}
+
+	memset(&regs, 0, sizeof(regs));
+	regs.rflags = 0x2;
+	regs.rip    = GUEST_START_ADDR;
+	regs.rsp    = ta->memory_size;
+
+	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
+		perror("KVM_SET_REGS");
+		vm_destroy(&v);
+		return NULL;
+	}
+
+	v.run->request_interrupt_window = (irq_pending > 0);
+
+	while (stop == 0) {
+		ret = ioctl(v.vcpu_fd, KVM_RUN, 0);
+		if (ret == -1) {
+			vm_log(ta->id, &line_start, "KVM_RUN failed\n");
+			vm_destroy(&v);
+			return NULL;
+		}
+
+		switch (v.run->exit_reason) {
+		case KVM_EXIT_IO:
+			if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
+				char *p = (char *)v.run;
+				char ch = *(p + v.run->io.data_offset);
+
+				if (linelen < sizeof(linebuf) - 1)
+					linebuf[linelen++] = ch;
+
+				if (ch == '\n' || linelen == sizeof(linebuf) - 1) {
+					vm_log(ta->id, &line_start, "%.*s", (int)linelen, linebuf);
+					linelen = 0;
+				}
+			}
+			else if (v.run->io.direction == KVM_EXIT_IO_IN && v.run->io.port == 0xE9) {
+				if (linelen > 0) {
+					vm_log(ta->id, &line_start, "%.*s", (int)linelen, linebuf);
+					linelen = 0;
+				}
+
+				char *p = (char *)v.run;
+				int c = getchar();
+				*(p + v.run->io.data_offset) = (c == EOF) ? 0 : (char)c;
+			}
+			else {
+				vm_log(ta->id, &line_start, "Unhandled KVM_EXIT_IO: direction=%d, port=0x%x\n",
+				       v.run->io.direction, v.run->io.port);
+				stop = 1;
+			}
+			continue;
+		case KVM_EXIT_IRQ_WINDOW_OPEN:
+			if (irq_pending > 0) {
+				if (inject_irq(&v, IRQ_NUM) < 0) {
+					vm_destroy(&v);
+					return NULL;
+				}
+				irq_pending--;
+			} else {
+				v.run->request_interrupt_window = 0;
+			}
+			continue;
+		case KVM_EXIT_HLT:
+			vm_log(ta->id, &line_start, "KVM_EXIT_HLT\n");
+			stop = 1;
+			break;
+		case KVM_EXIT_SHUTDOWN:
+			vm_log(ta->id, &line_start, "Shutdown\n");
+			stop = 1;
+			break;
+		default:
+			vm_log(ta->id, &line_start, "Default - exit reason: %d\n", v.run->exit_reason);
+			break;
+		}
+	}
+
+	if (linelen > 0)
+		vm_log(ta->id, &line_start, "%.*s\n", (int)linelen, linebuf);
+
+	vm_destroy(&v);
+	return NULL;
+}
+
+
+int main(int argc, char *argv[])
+{
 	if (argc < 2) {
 		printf("The program requests an image to run: %s <guest-image>\n", argv[0]);
 		return 1;
@@ -27,84 +174,33 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (vm_init(&v, args.memory_size)) {
-		printf("Failed to init the VM\n");
+	pthread_t *threads = malloc(args.guest_count * sizeof(*threads));
+	struct vm_thread_arg *thread_args = malloc(args.guest_count * sizeof(*thread_args));
+
+	if (!threads || !thread_args) {
+		fprintf(stderr, "out of memory\n");
 		return 1;
 	}
 
-	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
-		perror("KVM_GET_SREGS");
-		vm_destroy(&v);
-		return 1;
-	}
+	for (size_t i = 0; i < args.guest_count; i++) {
+		thread_args[i].guest_path = args.guest_paths[i];
+		thread_args[i].memory_size = args.memory_size;
+		thread_args[i].page_size = args.page_size;
+		thread_args[i].id = (int)i;
 
-	setup_long_mode(&v, &sregs);
-
-	if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
-		perror("KVM_SET_SREGS");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	if (load_guest_image(&v, args.guest_paths[0], GUEST_START_ADDR) < 0) {
-		printf("Failed to load guest image\n");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	memset(&regs, 0, sizeof(regs));
-	regs.rflags = 0x2;
-	regs.rip    = 0;
-	regs.rsp    = 2 << 20;
-
-	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
-		perror("KVM_SET_REGS");
-		vm_destroy(&v);
-		return 1;
-	}
-
-	v.run->request_interrupt_window = (irq_pending > 0);
-
-	while (stop == 0) {
-		ret = ioctl(v.vcpu_fd, KVM_RUN, 0);
-		if (ret == -1) {
-			printf("KVM_RUN failed\n");
-			vm_destroy(&v);
-			return 1;
-		}
-
-		switch (v.run->exit_reason) {
-		case KVM_EXIT_IO:
-			if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
-				char *p = (char *)v.run;
-				printf("%c", *(p + v.run->io.data_offset));
-			}
-			continue;
-		case KVM_EXIT_IRQ_WINDOW_OPEN:
-			if (irq_pending > 0) {
-				if (inject_irq(&v, IRQ_NUM) < 0) {
-					vm_destroy(&v);
-					return 1;
-				}
-				irq_pending--;
-			} else {
-				v.run->request_interrupt_window = 0;
-			}
-			continue;
-		case KVM_EXIT_HLT:
-			printf("KVM_EXIT_HLT\n");
-			stop = 1;
-			break;
-		case KVM_EXIT_SHUTDOWN:
-			printf("Shutdown\n");
-			stop = 1;
-			break;
-		default:
-			printf("Default - exit reason: %d\n", v.run->exit_reason);
+		if (pthread_create(&threads[i], NULL, vm_thread_main, &thread_args[i]) != 0) {
+			fprintf(stderr, "failed to create thread for VM %zu\n", i);
+			args.guest_count = i;   /* only join threads that actually started */
 			break;
 		}
 	}
 
-	vm_destroy(&v);
+	for (size_t i = 0; i < args.guest_count; i++)
+		pthread_join(threads[i], NULL);
+
+	free(threads);
+	free(thread_args);
+	hv_args_free(&args);
+
 	return 0;
 }

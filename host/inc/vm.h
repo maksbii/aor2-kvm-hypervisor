@@ -1,6 +1,8 @@
 #ifndef VM_H
 #define VM_H
 
+#include "parser.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <linux/kvm.h>
@@ -35,7 +37,7 @@ struct vm {
 
 int  vm_init(struct vm *v, size_t mem_size);
 void vm_destroy(struct vm *v);
-void setup_long_mode(struct vm *v, struct kvm_sregs *sregs);
+void setup_long_mode(struct vm *v, struct kvm_sregs *sregs, enum page_size pageSize);
 int  load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr);
 int  inject_irq(struct vm *v, unsigned int vector);
 
