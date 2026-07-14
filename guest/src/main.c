@@ -54,6 +54,7 @@ _start(void)
 	const char *s;
 	for (s = "Hello, world!\n"; *s; ++s)
 		outb(0xE9, *s);
+	 
 
 	uint8_t c = inb(0xE9);
 	outb(0xE9, c);

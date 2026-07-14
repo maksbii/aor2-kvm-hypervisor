@@ -1,6 +1,7 @@
 #include "vm.h"
 #include "parser.h"
 #include "fileio.h"
+#include "irqbuf.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -17,6 +18,9 @@ struct vm_thread_arg {
 	int id;
 	struct shared_file *shared_files;
 	size_t shared_count;
+
+	int is_writer;
+	struct irq_buffer *irq_buf;
 };
 
 static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -25,20 +29,24 @@ static void vm_log(int id, int *line_start, const char *fmt, ...)
 {
 	va_list ap;
 	char buf[256];
+	int n;
 	size_t len;
 
 	va_start(ap, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, ap);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+
+	if (n < 0)
+		return;
+	len = ((size_t)n < sizeof(buf)) ? (size_t)n : sizeof(buf) - 1;
 
 	pthread_mutex_lock(&stdout_lock);
 	if (*line_start)
 		printf("[VM %d] ", id);
-	fputs(buf, stdout);
+	fwrite(buf, 1, len, stdout);
 	fflush(stdout);
 	pthread_mutex_unlock(&stdout_lock);
 
-	len = strlen(buf);
 	*line_start = (len > 0 && buf[len - 1] == '\n');
 }
 
@@ -50,11 +58,14 @@ static void *vm_thread_main(void *arg) {
 	struct kvm_regs regs;
 	int stop = 0;
 	int ret = 0;
-	int irq_pending = IRQ_COUNT;
+	int irq_safety = 1000000; /* defensive cap in case the protocol never sets done */
 	char linebuf[256];
 	size_t linelen = 0;
 	int line_start = 1;
 	struct file_session fs;
+	struct irqbuf_session irq_sess;
+
+	irqbuf_session_init(&irq_sess, ta->irq_buf, ta->id, ta->is_writer);
 
 	if (vm_init(&v, ta->memory_size)) {
 		vm_log(ta->id, &line_start, "Failed to init\n");
@@ -66,6 +77,7 @@ static void *vm_thread_main(void *arg) {
 	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
 		perror("KVM_GET_SREGS");
 		file_session_destroy(&fs);
+		irqbuf_session_destroy(&irq_sess);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -75,6 +87,7 @@ static void *vm_thread_main(void *arg) {
 	if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
 		perror("KVM_SET_SREGS");
 		file_session_destroy(&fs);
+		irqbuf_session_destroy(&irq_sess);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -82,6 +95,7 @@ static void *vm_thread_main(void *arg) {
 	if (load_guest_image(&v, ta->guest_path, GUEST_START_ADDR) < 0) {
 		vm_log(ta->id, &line_start, "Failed to load guest image\n");
 		file_session_destroy(&fs);
+		irqbuf_session_destroy(&irq_sess);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -94,17 +108,21 @@ static void *vm_thread_main(void *arg) {
 	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");
 		file_session_destroy(&fs);
+		irqbuf_session_destroy(&irq_sess);
 		vm_destroy(&v);
 		return NULL;
 	}
 
-	v.run->request_interrupt_window = (irq_pending > 0);
+	v.run->request_interrupt_window = 1;
+
+	int first_interrupt = 1;
 
 	while (stop == 0) {
 		ret = ioctl(v.vcpu_fd, KVM_RUN, 0);
 		if (ret == -1) {
 			vm_log(ta->id, &line_start, "KVM_RUN failed\n");
 			file_session_destroy(&fs);
+			irqbuf_session_destroy(&irq_sess);
 			vm_destroy(&v);
 			return NULL;
 		}
@@ -140,6 +158,33 @@ static void *vm_thread_main(void *arg) {
 				else
 					*(uint8_t *)(p + v.run->io.data_offset) = fileio_handle_in(&fs);
 			}
+			else if (v.run->io.port == 0x510) {
+				uint8_t *p = (uint8_t *)v.run;
+				if (first_interrupt && v.run->io.direction == KVM_EXIT_IO_IN) {
+					first_interrupt = 0;
+					if (ta->is_writer) {
+						*(p + v.run->io.data_offset) = 1;
+					}
+					else {
+						*(p + v.run->io.data_offset) = 0;
+					}
+				}
+				else if (ta->is_writer && v.run->io.direction == KVM_EXIT_IO_OUT) {
+					irqbuf_out_510(&irq_sess, *(p + v.run->io.data_offset));
+				}
+				else if (!ta->is_writer && v.run->io.direction == KVM_EXIT_IO_IN) {
+					*(p + v.run->io.data_offset) = irqbuf_in_510(&irq_sess);
+				}
+			}
+			else if (v.run->io.port == 0x520) {
+				uint8_t *p = (uint8_t *)v.run;
+				if (ta->is_writer && v.run->io.direction == KVM_EXIT_IO_IN) {
+					*(p + v.run->io.data_offset) = irqbuf_in_520(&irq_sess);
+				}
+				else if (!ta->is_writer && v.run->io.direction == KVM_EXIT_IO_OUT) {
+					irqbuf_out_520(&irq_sess, *(p + v.run->io.data_offset));
+				}
+			}
 			else {
 				vm_log(ta->id, &line_start, "Unhandled KVM_EXIT_IO: direction=%d, port=0x%x\n",
 				       v.run->io.direction, v.run->io.port);
@@ -147,13 +192,14 @@ static void *vm_thread_main(void *arg) {
 			}
 			continue;
 		case KVM_EXIT_IRQ_WINDOW_OPEN:
-			if (irq_pending > 0) {
+			if (!irq_sess.done && irq_safety > 0) {
 				if (inject_irq(&v, IRQ_NUM) < 0) {
 					file_session_destroy(&fs);
+					irqbuf_session_destroy(&irq_sess);
 					vm_destroy(&v);
 					return NULL;
 				}
-				irq_pending--;
+				irq_safety--;
 			} else {
 				v.run->request_interrupt_window = 0;
 			}
@@ -177,6 +223,7 @@ static void *vm_thread_main(void *arg) {
 		vm_log(ta->id, &line_start, "%.*s\n", (int)linelen, linebuf);
 
 	file_session_destroy(&fs);
+	irqbuf_session_destroy(&irq_sess);
 	vm_destroy(&v);
 	return NULL;
 }
@@ -206,6 +253,10 @@ int main(int argc, char *argv[])
 	struct shared_file *shared_files = shared_files_create(args.shared_paths, args.shared_count,
 	                                                        args.guest_count);
 
+	
+	struct irq_buffer irq_buf;
+	irq_buffer_init(&irq_buf, (int)(args.guest_count > 0 ? args.guest_count - 1 : 0));  // All VMs except the writer are readers
+
 	for (size_t i = 0; i < args.guest_count; i++) {
 		thread_args[i].guest_path = args.guest_paths[i];
 		thread_args[i].memory_size = args.memory_size;
@@ -213,6 +264,9 @@ int main(int argc, char *argv[])
 		thread_args[i].id = (int)i;
 		thread_args[i].shared_files = shared_files;
 		thread_args[i].shared_count = args.shared_count;
+		if (i == 0) thread_args[i].is_writer = 1; 
+		else thread_args[i].is_writer = 0;
+		thread_args[i].irq_buf = &irq_buf;
 
 		if (pthread_create(&threads[i], NULL, vm_thread_main, &thread_args[i]) != 0) {
 			fprintf(stderr, "failed to create thread for VM %zu\n", i);
@@ -224,6 +278,7 @@ int main(int argc, char *argv[])
 	for (size_t i = 0; i < args.guest_count; i++)
 		pthread_join(threads[i], NULL);
 
+	irq_buffer_destroy(&irq_buf);
 	shared_files_destroy(shared_files, args.shared_count, args.guest_count);
 	free(threads);
 	free(thread_args);

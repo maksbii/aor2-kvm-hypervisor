@@ -2,3 +2,4 @@
 /guest/build/
 /vm*_files/
 /test*.txt
+/source.txt
