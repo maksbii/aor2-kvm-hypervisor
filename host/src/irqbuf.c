@@ -176,6 +176,9 @@ void irqbuf_out_520(struct irqbuf_session *s, uint8_t byte)
 	if (s->byte_idx < 4)
 		return;
 
+	if (s->count != s->xfer_len)
+		s->protocol_error = 1;   /* reader didn't read everything it was sent */
+
 	pthread_mutex_lock(&ib->lock);
 	ib->readers_done++;
 	if (ib->readers_done == ib->readers_total) {

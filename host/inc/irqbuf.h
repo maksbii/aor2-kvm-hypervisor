@@ -41,6 +41,7 @@ struct irqbuf_session {
     uint32_t xfer_pos;            /* streaming position within xfer[] */
 
     int done;   /* set once an empty (EOF) round has been sent/received */
+    int protocol_error;   /* set if a reader reports fewer bytes read than were sent */
 };
 
 void irqbuf_session_init(struct irqbuf_session *s, struct irq_buffer *ib, int vm_id, int is_writer);

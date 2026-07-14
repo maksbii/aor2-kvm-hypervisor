@@ -183,6 +183,11 @@ static void *vm_thread_main(void *arg) {
 				}
 				else if (!ta->is_writer && v.run->io.direction == KVM_EXIT_IO_OUT) {
 					irqbuf_out_520(&irq_sess, *(p + v.run->io.data_offset));
+					if (irq_sess.protocol_error) {
+						vm_log(ta->id, &line_start,
+						       "Reader did not read all bytes, stopping VM\n");
+						stop = 1;
+					}
 				}
 			}
 			else {
