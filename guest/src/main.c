@@ -1,6 +1,7 @@
 #include "descriptors.h"
 #include "interrupts.h"
 #include "io.h"
+#include "fileio.h"
 
 static struct gdt_entry gdt[3];
 
@@ -57,6 +58,26 @@ _start(void)
 	uint8_t c = inb(0xE9);
 	outb(0xE9, c);
 	outb(0xE9, '\n');
+
+	int fd = open("test1.txt", O_WR | O_CREATE);
+	if (fd >= 0) {
+		const char *msg = "Hello file!\n";
+		int len = 0;
+		while (msg[len]) len++;
+		write(fd, msg, len);
+		close(fd);
+
+		fd = open("test.txt", O_RD);
+		if (fd >= 0) {
+			char rbuf[64];
+			int n = read(fd, rbuf, sizeof(rbuf));
+			for (int i = 0; i < n; i++)
+				outb(0xE9, rbuf[i]);
+			close(fd);
+		}
+	}
+
+	
 
 	for (;;)
 		asm volatile("hlt");

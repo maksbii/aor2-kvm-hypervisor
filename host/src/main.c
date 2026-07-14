@@ -1,5 +1,6 @@
 #include "vm.h"
 #include "parser.h"
+#include "fileio.h"
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -14,6 +15,8 @@ struct vm_thread_arg {
 	uint64_t memory_size;
 	enum page_size page_size;
 	int id;
+	struct shared_file *shared_files;
+	size_t shared_count;
 };
 
 static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -51,14 +54,18 @@ static void *vm_thread_main(void *arg) {
 	char linebuf[256];
 	size_t linelen = 0;
 	int line_start = 1;
+	struct file_session fs;
 
 	if (vm_init(&v, ta->memory_size)) {
 		vm_log(ta->id, &line_start, "Failed to init\n");
 		return NULL;
 	}
 
+	file_session_init(&fs, ta->id, ta->shared_files, ta->shared_count);
+
 	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
 		perror("KVM_GET_SREGS");
+		file_session_destroy(&fs);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -67,12 +74,14 @@ static void *vm_thread_main(void *arg) {
 
 	if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
 		perror("KVM_SET_SREGS");
+		file_session_destroy(&fs);
 		vm_destroy(&v);
 		return NULL;
 	}
 
 	if (load_guest_image(&v, ta->guest_path, GUEST_START_ADDR) < 0) {
 		vm_log(ta->id, &line_start, "Failed to load guest image\n");
+		file_session_destroy(&fs);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -84,6 +93,7 @@ static void *vm_thread_main(void *arg) {
 
 	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");
+		file_session_destroy(&fs);
 		vm_destroy(&v);
 		return NULL;
 	}
@@ -94,6 +104,7 @@ static void *vm_thread_main(void *arg) {
 		ret = ioctl(v.vcpu_fd, KVM_RUN, 0);
 		if (ret == -1) {
 			vm_log(ta->id, &line_start, "KVM_RUN failed\n");
+			file_session_destroy(&fs);
 			vm_destroy(&v);
 			return NULL;
 		}
@@ -122,6 +133,13 @@ static void *vm_thread_main(void *arg) {
 				int c = getchar();
 				*(p + v.run->io.data_offset) = (c == EOF) ? 0 : (char)c;
 			}
+			else if (v.run->io.port == FILEIO_PORT) {
+				char *p = (char *)v.run;
+				if (v.run->io.direction == KVM_EXIT_IO_OUT)
+					fileio_handle_out(&fs, *(uint8_t *)(p + v.run->io.data_offset));
+				else
+					*(uint8_t *)(p + v.run->io.data_offset) = fileio_handle_in(&fs);
+			}
 			else {
 				vm_log(ta->id, &line_start, "Unhandled KVM_EXIT_IO: direction=%d, port=0x%x\n",
 				       v.run->io.direction, v.run->io.port);
@@ -131,6 +149,7 @@ static void *vm_thread_main(void *arg) {
 		case KVM_EXIT_IRQ_WINDOW_OPEN:
 			if (irq_pending > 0) {
 				if (inject_irq(&v, IRQ_NUM) < 0) {
+					file_session_destroy(&fs);
 					vm_destroy(&v);
 					return NULL;
 				}
@@ -149,6 +168,7 @@ static void *vm_thread_main(void *arg) {
 			break;
 		default:
 			vm_log(ta->id, &line_start, "Default - exit reason: %d\n", v.run->exit_reason);
+			stop = 1;
 			break;
 		}
 	}
@@ -156,6 +176,7 @@ static void *vm_thread_main(void *arg) {
 	if (linelen > 0)
 		vm_log(ta->id, &line_start, "%.*s\n", (int)linelen, linebuf);
 
+	file_session_destroy(&fs);
 	vm_destroy(&v);
 	return NULL;
 }
@@ -182,11 +203,16 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	struct shared_file *shared_files = shared_files_create(args.shared_paths, args.shared_count,
+	                                                        args.guest_count);
+
 	for (size_t i = 0; i < args.guest_count; i++) {
 		thread_args[i].guest_path = args.guest_paths[i];
 		thread_args[i].memory_size = args.memory_size;
 		thread_args[i].page_size = args.page_size;
 		thread_args[i].id = (int)i;
+		thread_args[i].shared_files = shared_files;
+		thread_args[i].shared_count = args.shared_count;
 
 		if (pthread_create(&threads[i], NULL, vm_thread_main, &thread_args[i]) != 0) {
 			fprintf(stderr, "failed to create thread for VM %zu\n", i);
@@ -198,6 +224,7 @@ int main(int argc, char *argv[])
 	for (size_t i = 0; i < args.guest_count; i++)
 		pthread_join(threads[i], NULL);
 
+	shared_files_destroy(shared_files, args.shared_count, args.guest_count);
 	free(threads);
 	free(thread_args);
 	hv_args_free(&args);

@@ -23,13 +23,32 @@ static int is_option(const char *s)
 	return s[0] == '-';
 }
 
+static int consume_paths(int argc, char *argv[], int *i, const char ***paths, size_t *count)
+{
+	size_t cap = 0;
+
+	while (*i + 1 < argc && !is_option(argv[*i + 1])) {
+		(*i)++;
+		if (*count == cap) {
+			cap = cap ? cap * 2 : 4;
+			const char **grown = realloc(*paths, cap * sizeof(**paths));
+			if (!grown)
+				return -1;
+			*paths = grown;
+		}
+		(*paths)[(*count)++] = argv[*i];
+	}
+	return 0;
+}
+
 int parse_args(int argc, char *argv[], struct hv_args *out)
 {
 	long memory_mb = -1;
 	long page_arg = -1;
 	const char **guest_paths = NULL;
 	size_t guest_count = 0;
-	size_t guest_cap = 0;
+	const char **shared_paths = NULL;
+	size_t shared_count = 0;
 
 	for (int i = 1; i < argc; i++) {
 		const char *arg = argv[i];
@@ -57,18 +76,14 @@ int parse_args(int argc, char *argv[], struct hv_args *out)
 				fprintf(stderr, "%s: %s requires at least one guest image path\n", argv[0], arg);
 				goto fail;
 			}
-			while (i + 1 < argc && !is_option(argv[i + 1])) {
-				i++;
-				if (guest_count == guest_cap) {
-					guest_cap = guest_cap ? guest_cap * 2 : 4;
-					const char **grown = realloc(guest_paths, guest_cap * sizeof(*grown));
-					if (!grown) {
-						fprintf(stderr, "%s: out of memory\n", argv[0]);
-						goto fail;
-					}
-					guest_paths = grown;
-				}
-				guest_paths[guest_count++] = argv[i];
+			if (consume_paths(argc, argv, &i, &guest_paths, &guest_count) < 0) {
+				fprintf(stderr, "%s: out of memory\n", argv[0]);
+				goto fail;
+			}
+		} else if (strcmp(arg, "-f") == 0 || strcmp(arg, "--file") == 0) {
+			if (consume_paths(argc, argv, &i, &shared_paths, &shared_count) < 0) {
+				fprintf(stderr, "%s: out of memory\n", argv[0]);
+				goto fail;
 			}
 		} else {
 			fprintf(stderr, "%s: unknown option '%s'\n", argv[0], arg);
@@ -91,14 +106,17 @@ int parse_args(int argc, char *argv[], struct hv_args *out)
 		goto fail;
 	}
 
-	out->memory_size = (uint64_t)memory_mb * MB;
-	out->page_size   = (page_arg == 4) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
-	out->guest_paths = guest_paths;
-	out->guest_count = guest_count;
+	out->memory_size  = (uint64_t)memory_mb * MB;
+	out->page_size    = (page_arg == 4) ? PAGE_SIZE_4KB : PAGE_SIZE_2MB;
+	out->guest_paths  = guest_paths;
+	out->guest_count  = guest_count;
+	out->shared_paths = shared_paths;
+	out->shared_count = shared_count;
 	return 0;
 
 fail:
 	free(guest_paths);
+	free(shared_paths);
 	return -1;
 }
 
@@ -107,4 +125,7 @@ void hv_args_free(struct hv_args *args)
 	free((void *)args->guest_paths);
 	args->guest_paths = NULL;
 	args->guest_count = 0;
+	free((void *)args->shared_paths);
+	args->shared_paths = NULL;
+	args->shared_count = 0;
 }

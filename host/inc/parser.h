@@ -14,19 +14,23 @@ struct hv_args {
 	enum page_size page_size;  /* 4KB or 2MB pages */
 	const char **guest_paths;  /* guest image paths, points into argv (not owned) */
 	size_t       guest_count;
+	const char **shared_paths; /* shared file paths, points into argv (not owned) */
+	size_t       shared_count;
 };
 
 /*
- * Parses command line arguments for the hypervisor (Phase A syntax):
+ * Parses command line arguments for the hypervisor (Phase A/B syntax):
  *
  *   -m, --memory <2|4|8>   guest memory size in MB
  *   -p, --page   <4|2>     page size: 4 -> 4KB pages, 2 -> 2MB pages
  *   -g, --guest  <path...> one or more guest image paths (consumes
  *                          arguments until the next option or end of argv)
+ *   -f, --file   <path...> zero or more shared file paths (consumes
+ *                          arguments until the next option or end of argv)
  *
- * All three options are required. On success, fills *out and returns 0.
- * On failure, prints a diagnostic to stderr and returns -1; *out is left
- * untouched and nothing needs to be freed.
+ * -m, -p and -g are required; -f is optional. On success, fills *out and
+ * returns 0. On failure, prints a diagnostic to stderr and returns -1;
+ * *out is left untouched and nothing needs to be freed.
  */
 int parse_args(int argc, char *argv[], struct hv_args *out);
 

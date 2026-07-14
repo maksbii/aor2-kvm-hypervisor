@@ -1,0 +1,4 @@
+/host/build/
+/guest/build/
+/vm*_files/
+/test*.txt
